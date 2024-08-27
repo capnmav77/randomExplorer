@@ -1,94 +1,231 @@
 import rclpy
 from rclpy.node import Node
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 import numpy as np
-from queue import Queue
+import math
+import heapq
+import scipy.interpolate as si
+from threading import Lock
 
 class Explorer(Node):
     def __init__(self):
         super().__init__('explorer')
+
+        # 2 subs , 1 pub and 1 action client
         self.map_sub = self.create_subscription(OccupancyGrid, 'map', self.map_callback, 10)
+        self.odom_sub = self.create_subscription(Odometry, 'odom', self.odom_callback, 10)
         self.goal_pub = self.create_publisher(PoseStamped, 'goal_pose', 10)
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        
+        # Initialize variables and locks
         self.map = None
+        self.odom = None
         self.exploring = False
+        self.map_lock = Lock()
+        self.odom_lock = Lock()
+        
+        # Parameters
+        self.expansion_size = 3  # Don't you fucking dare change this
+        self.target_error = 0.5  # same here !
+        self.safety_distance = 5
+        
         self.get_logger().info('Explorer node initialized')
-        self.top_interests = Queue()
 
     def map_callback(self, msg):
-        self.get_logger().info('Received map update')
-        self.map = msg
+        with self.map_lock:
+            self.map = msg
         if not self.exploring:
             self.exploring = True
             self.explore()
 
+    def odom_callback(self, msg):
+        with self.odom_lock:
+            self.odom = msg
+
+    def view_map(self, map):
+        with open('/home/neo/Robotics/Nav2Sensors/src/my_explorer/my_explorer/map.txt', 'w') as file:
+            for i in range(len(map)):
+                for j in range(len(map[0])):
+                    file.write(str(map[i, j]) + ' ')
+                file.write('\n')
+    
+
     def explore(self):
         self.get_logger().info('Starting exploration')
-        if self.map is None:
-            self.get_logger().warn('No map available')
+        if self.map is None or self.odom is None:
+            self.get_logger().warn('No map or odometry available')
             return
 
-        # if(self.top_interests.empty()):
-        #     self.find_frontier()
-        #select the first frontier cell from the queue and pop it 
-        frontier = self.find_frontier()
+        with self.map_lock:
+            map_data = np.array(self.map.data).reshape((self.map.info.height, self.map.info.width)) 
+            self.view_map(map_data)
+        
+        with self.odom_lock:
+            current_pos = (self.odom.pose.pose.position.x, self.odom.pose.pose.position.y)
 
+        frontier = self.find_frontier(map_data)
         if frontier is not None:
-            goal = PoseStamped()
-            goal.header = self.map.header
-            goal.pose.position.x = frontier[0] * self.map.info.resolution + self.map.info.origin.position.x
-            goal.pose.position.y = frontier[1] * self.map.info.resolution + self.map.info.origin.position.y
-            goal.pose.orientation.w = 1.0
-
-            self.get_logger().info(f'Moving to frontier: ({goal.pose.position.x}, {goal.pose.position.y})')
-            self.send_goal(goal)
+            path = self.plan_path(map_data, current_pos, frontier)
+            if path:
+                # non_smoothed_goal = path[-1] if path else frontier
+                smoothed_path = self.smooth_path(path)
+                goal = self.path_to_pose(smoothed_path[-1])
+                #non_smoothed_goal = self.path_to_pose(path[-1])
+                self.send_goal(goal)
+            else:
+                self.get_logger().warn('No path found to frontier')
+                self.exploring = False
         else:
             self.get_logger().info('No frontiers found. Exploration complete.')
             self.exploring = False
 
-    def find_frontier(self):
-        self.get_logger().info('Finding frontier')
-        map_data = np.array(self.map.data).reshape((self.map.info.height, self.map.info.width))
-        frontier_cells = []
+    def find_frontier(self, map_data):
+        frontiers = self.detect_frontiers(map_data)
+        if frontiers:
+            return self.select_best_frontier(frontiers, map_data)
+        return None
 
-        for y in range(1, self.map.info.height - 1):
-            for x in range(1, self.map.info.width - 1):
+    def detect_frontiers(self, map_data):
+        frontier_cells = []
+        for y in range(1, map_data.shape[0] - 1):
+            for x in range(1, map_data.shape[1] - 1):
                 if map_data[y, x] == 0:  # Free cell
                     if -1 in map_data[y-1:y+2, x-1:x+2]:  # Adjacent to unknown
                         frontier_cells.append((x, y))
+        return frontier_cells
 
-        if frontier_cells:
-            self.get_logger().info(f'Found {len(frontier_cells)} frontier cells')
-            # finding the closest frontier cell and pushing the top 5 frontier cells to the queue
-            #self.get_fartherest_frontiers_count5(frontier_cells)
-            return frontier_cells[np.random.randint(len(frontier_cells))]
-        self.get_logger().warn('No frontier cells found')
+    def select_best_frontier(self, frontiers, map_data):
+        if not frontiers:
+            return None
+        
+        # Group frontiers
+        groups = self.group_frontiers(frontiers, map_data)
+        
+        # Select the largest group
+        largest_group = max(groups, key=lambda g: len(g))
+        
+        # Return the centroid of the largest group
+        return self.calculate_centroid(largest_group)
+
+    def group_frontiers(self, frontiers, map_data):
+        groups = []
+        for frontier in frontiers:
+            added = False
+            for group in groups:
+                if self.is_adjacent(frontier, group[0], map_data):
+                    group.append(frontier)
+                    added = True
+                    break
+            if not added:
+                groups.append([frontier])
+        return groups
+
+    def is_adjacent(self, cell1, cell2, map_data):
+        return abs(cell1[0] - cell2[0]) <= 1 and abs(cell1[1] - cell2[1]) <= 1
+
+    def calculate_centroid(self, group):
+        x = sum(cell[0] for cell in group) / len(group)
+        y = sum(cell[1] for cell in group) / len(group)
+        return (int(x), int(y))
+
+    def plan_path(self, map_data, start, goal):
+        # Convert start and goal to grid coordinates
+        start_grid = self.world_to_grid(start)
+        goal_grid = goal  # goal is already in grid coordinates
+
+        # Implement A* pathfinding
+        path = self.astar(map_data, start_grid, goal_grid)
+        
+        if path:
+            # Convert path back to world coordinates
+            return [self.grid_to_world(cell) for cell in path]
         return None
-    
-    
-    def get_fartherest_frontiers_count5(self, frontier_cells):
-        if(len(frontier_cells) < 5):
-            for i in range(len(frontier_cells)):
-                self.top_interests.put(frontier_cells[i])
-        else:
-            # finding the farthest frontier cell and pushing the top 5 frontier cells to the queue
-            for i in range(5):
-                max_distance = 0
-                max_distance_index = 0
-                for j in range(len(frontier_cells)):
-                    distance = np.sqrt((frontier_cells[j][0] - self.map.info.width/2)**2 + (frontier_cells[j][1] - self.map.info.height/2)**2)
-                    if distance > max_distance:
-                        max_distance = distance
-                        max_distance_index = j
-                self.top_interests.put(frontier_cells[max_distance_index])
-                frontier_cells.pop(max_distance_index)
 
+    def world_to_grid(self, pos):
+        x = int((pos[0] - self.map.info.origin.position.x) / self.map.info.resolution)
+        y = int((pos[1] - self.map.info.origin.position.y) / self.map.info.resolution)
+        return (x, y)
+
+    def grid_to_world(self, cell):
+        x = cell[0] * self.map.info.resolution + self.map.info.origin.position.x
+        y = cell[1] * self.map.info.resolution + self.map.info.origin.position.y
+        return (x, y)
+
+    def astar(self, array, start, goal):
+        neighbors = [(0,1),(0,-1),(1,0),(-1,0),(1,1),(1,-1),(-1,1),(-1,-1)]
+        close_set = set()
+        came_from = {}
+        gscore = {start:0}
+        fscore = {start:self.heuristic(start, goal)}
+        oheap = []
+        heapq.heappush(oheap, (fscore[start], start))
+        
+        while oheap:
+            current = heapq.heappop(oheap)[1]
+            if current == goal:
+                data = []
+                while current in came_from:
+                    data.append(current)
+                    current = came_from[current]
+                return data[::-1]
+            
+            close_set.add(current)
+            for i, j in neighbors:
+                neighbor = current[0] + i, current[1] + j
+                tentative_g_score = gscore[current] + self.heuristic(current, neighbor)
+                if 0 <= neighbor[0] < array.shape[1] and 0 <= neighbor[1] < array.shape[0]:
+                    if array[neighbor[1]][neighbor[0]] == 100:
+                        continue
+                else:
+                    continue
+                
+                if neighbor in close_set and tentative_g_score >= gscore.get(neighbor, 0):
+                    continue
+                
+                if tentative_g_score < gscore.get(neighbor, 0) or neighbor not in [i[1]for i in oheap]:
+                    came_from[neighbor] = current
+                    gscore[neighbor] = tentative_g_score
+                    fscore[neighbor] = tentative_g_score + self.heuristic(neighbor, goal)
+                    heapq.heappush(oheap, (fscore[neighbor], neighbor))
+        
+        return False
+
+    def heuristic(self, a, b):
+        return np.sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
+
+    def smooth_path(self, path):
+        if len(path) < 4:
+            return path
+        
+        x = [p[0] for p in path]
+        y = [p[1] for p in path]
+        
+        t = range(len(x))
+        x_tup = si.splrep(t, x, k=3)
+        y_tup = si.splrep(t, y, k=3)
+        
+        x_list = list(x_tup)
+        y_list = list(y_tup)
+        
+        ipl_t = np.linspace(0.0, len(x) - 1, 100)
+        rx = si.splev(ipl_t, x_list)
+        ry = si.splev(ipl_t, y_list)
+        
+        return list(zip(rx, ry))
+
+    def path_to_pose(self, point):
+        goal = PoseStamped()
+        goal.header = self.map.header
+        goal.pose.position.x = point[0]
+        goal.pose.position.y = point[1]
+        goal.pose.orientation.w = 1.0
+        return goal
 
     def send_goal(self, goal):
-        self.get_logger().info('Sending goal to navigation stack')
+        self.get_logger().info(f'Sending goal: ({goal.pose.position.x}, {goal.pose.position.y})')
         self.nav_client.wait_for_server()
         self.future = self.nav_client.send_goal_async(NavigateToPose.Goal(pose=goal))
         self.future.add_done_callback(self.goal_response_callback)
@@ -97,6 +234,7 @@ class Explorer(Node):
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().warn('Goal rejected')
+            self.exploring = False
             return
 
         self.get_logger().info('Goal accepted')

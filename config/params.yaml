@@ -1,0 +1,5 @@
+lookahead_distance : 0.24 # this is the distance between the robot and the target point
+speed : 0.18 # this is the speed of the robot
+expansion_size : 3 #this is the size of the expansion grid
+target_error : 0.15 # this is the error between the robot and the target point
+robot_r : 0.2 # this is the radius of the robot

@@ -11,7 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', 
-            ['launch/my_explorer.launch.py']),
+            ['launch/my_explorer_launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
