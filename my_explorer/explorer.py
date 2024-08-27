@@ -30,7 +30,7 @@ class Explorer(Node):
         # Parameters
         self.expansion_size = 3  # Don't you fucking dare change this
         self.target_error = 0.5  # same here !
-        self.safety_distance = 5
+        self.safety_distance = 2
         
         self.get_logger().info('Explorer node initialized')
 
@@ -53,6 +53,23 @@ class Explorer(Node):
                 file.write('\n')
     
 
+    def is_point_safe(self, map_data, point):
+        x, y = point
+        for dx in range(-self.safety_distance, self.safety_distance + 1):
+            for dy in range(-self.safety_distance, self.safety_distance + 1):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < map_data.shape[1] and 0 <= ny < map_data.shape[0]:
+                    if map_data[ny, nx] == 100:  # Occupied cell
+                        return False
+        return True
+
+    def find_safe_goal(self, map_data, path):
+        for point in reversed(path):
+            grid_point = self.world_to_grid(point)
+            if self.is_point_safe(map_data, grid_point):
+                return point
+        return None
+
     def explore(self):
         self.get_logger().info('Starting exploration')
         if self.map is None or self.odom is None:
@@ -62,7 +79,7 @@ class Explorer(Node):
         with self.map_lock:
             map_data = np.array(self.map.data).reshape((self.map.info.height, self.map.info.width)) 
             self.view_map(map_data)
-        
+
         with self.odom_lock:
             current_pos = (self.odom.pose.pose.position.x, self.odom.pose.pose.position.y)
 
@@ -70,11 +87,14 @@ class Explorer(Node):
         if frontier is not None:
             path = self.plan_path(map_data, current_pos, frontier)
             if path:
-                # non_smoothed_goal = path[-1] if path else frontier
-                smoothed_path = self.smooth_path(path)
-                goal = self.path_to_pose(smoothed_path[-1])
-                #non_smoothed_goal = self.path_to_pose(path[-1])
-                self.send_goal(goal)
+                smoothed_path = self.smooth_path(map_data, path)
+                safe_goal = self.find_safe_goal(map_data, smoothed_path)
+                if safe_goal:
+                    goal = self.path_to_pose(safe_goal)
+                    self.send_goal(goal)
+                else:
+                    self.get_logger().warn('No safe goal found')
+                    self.exploring = False
             else:
                 self.get_logger().warn('No path found to frontier')
                 self.exploring = False
@@ -162,7 +182,7 @@ class Explorer(Node):
         fscore = {start:self.heuristic(start, goal)}
         oheap = []
         heapq.heappush(oheap, (fscore[start], start))
-        
+
         while oheap:
             current = heapq.heappop(oheap)[1]
             if current == goal:
@@ -171,51 +191,52 @@ class Explorer(Node):
                     data.append(current)
                     current = came_from[current]
                 return data[::-1]
-            
+
             close_set.add(current)
             for i, j in neighbors:
                 neighbor = current[0] + i, current[1] + j
                 tentative_g_score = gscore[current] + self.heuristic(current, neighbor)
                 if 0 <= neighbor[0] < array.shape[1] and 0 <= neighbor[1] < array.shape[0]:
-                    if array[neighbor[1]][neighbor[0]] == 100:
+                    if not self.is_point_safe(array, neighbor):
                         continue
                 else:
                     continue
-                
+
                 if neighbor in close_set and tentative_g_score >= gscore.get(neighbor, 0):
                     continue
-                
+
                 if tentative_g_score < gscore.get(neighbor, 0) or neighbor not in [i[1]for i in oheap]:
                     came_from[neighbor] = current
                     gscore[neighbor] = tentative_g_score
                     fscore[neighbor] = tentative_g_score + self.heuristic(neighbor, goal)
                     heapq.heappush(oheap, (fscore[neighbor], neighbor))
-        
+
         return False
 
     def heuristic(self, a, b):
         return np.sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
 
-    def smooth_path(self, path):
+    def smooth_path(self, map_data, path):
         if len(path) < 4:
             return path
-        
+
         x = [p[0] for p in path]
         y = [p[1] for p in path]
-        
+
         t = range(len(x))
         x_tup = si.splrep(t, x, k=3)
         y_tup = si.splrep(t, y, k=3)
-        
+
         x_list = list(x_tup)
         y_list = list(y_tup)
-        
+
         ipl_t = np.linspace(0.0, len(x) - 1, 100)
         rx = si.splev(ipl_t, x_list)
         ry = si.splev(ipl_t, y_list)
-        
-        return list(zip(rx, ry))
 
+        smoothed_path = list(zip(rx, ry))
+        return [p for p in smoothed_path if self.is_point_safe(map_data, self.world_to_grid(p))]
+    
     def path_to_pose(self, point):
         goal = PoseStamped()
         goal.header = self.map.header
