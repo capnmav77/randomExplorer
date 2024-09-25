@@ -30,7 +30,7 @@ class Explorer(Node):
         # Parameters
         self.expansion_size = 3  # Don't you fucking dare change this
         self.target_error = 0.5  # same here !
-        self.safety_distance = 2
+        self.safety_distance = 1
         
         self.get_logger().info('Explorer node initialized')
 

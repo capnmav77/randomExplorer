@@ -19,7 +19,6 @@ setup(
     maintainer_email='itshelp@gmail.com',
     description='Package for exploring a 2D Grid World with TurtleBot3',
     license='Apache 2.0',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'explorer = my_explorer.explorer:main',
