@@ -7,6 +7,8 @@ from nav_msgs.msg import Odometry
 from my_object_localization.object_database import ObjectDatabase
 import numpy as np
 from my_object_localization.yolo_detector import YoloDetect
+import sensor_msgs_py.point_cloud2 as pc2
+
 
 class ObjectDetector(Node):
     def __init__(self):
@@ -71,8 +73,8 @@ class ObjectDetector(Node):
 
         print("Objects detected: ", self.objects)
         for obj in self.objects:
-            # obj_depth = self.get_depth(obj['position'])
-            # print('Object depth:',obj_depth)
+            obj_depth = self.get_depth(obj['position'])
+            #print('Object depth:',obj_depth)
             # if obj_depth < 1:
             self.object_database.add_object(obj['description'], self.Current_position, obj['confidence'])
 
@@ -89,40 +91,43 @@ class ObjectDetector(Node):
   
     def get_depth(self, bbox):
         if self.point_cloud is None:
-            print('Point cloud is None')
-            return float('inf')
+            return None
 
-        x_min, y_min, x_max, y_max = map(int, bbox)
+        # Convert PointCloud2 to a list of points
+        point_list = list(pc2.read_points(self.point_cloud, field_names=("x", "y", "z"), skip_nans=True))
+        #print('Point List:',point_list)
 
-        # Access point cloud data
-        pc_data = np.frombuffer(self.point_cloud.data, dtype=np.float32)
-        width = self.point_cloud.width
-        height = self.point_cloud.height
-        point_step = self.point_cloud.point_step
+        # Calculate the bounding box coordinates
+        x_min, y_min, x_max, y_max = bbox
 
-        # Ensure the bounding box is within the image dimensions
-        x_min = max(0, x_min)
-        y_min = max(0, y_min)
-        x_max = min(width - 1, x_max)
-        y_max = min(height - 1, y_max)
+        # Initialize variables to compute the average depth
+        total_depth = 0
+        depthx = 0
+        depthy = 0
+        count = 0
 
-        # Validate the bounding box
-        if x_max < x_min or y_max < y_min:
-            print('Invalid bounding box')
-            return float('inf')
+        # iterate over the points that fall in the range of the bounding box
+        for i in range(int(x_min), int(x_max)):
+            for j in range(int(y_min), int(y_max)):
+                # Calculate the index of the point in the point cloud
+                index = i * 320 + j
+                # Get the depth of the point
+                depth = point_list[index][2]
+                dx = point_list[index][0]
+                dy = point_list[index][1]
+                # Check if the depth is a valid number
+                if not np.isnan(depth):
+                    total_depth += depth
+                    depthx += dx
+                    depthy += dy
+                    count += 1
 
-        # Extract Z coordinates efficiently
-        valid_z_values = []
-        for y in range(y_min, y_max + 1):
-            for x in range(x_min, x_max + 1):
-                idx = (y * width + x) * point_step  # Accessing the first element of the point
-                if idx + 8 < pc_data.size * pc_data.itemsize:  # Ensure we're within bounds
-                    z_value = pc_data[idx + 2]  # Z is usually the 3rd value (index 2)
-                    if z_value > 0:  # Check if the depth is valid
-                        valid_z_values.append(z_value)
-
-        if not valid_z_values:
-            print('No valid Z values found')
-            return float('inf')  # Return infinity if no valid depth found
-
-        return np.mean(valid_z_values)  # Return the average depth of the detected object
+        # Calculate average depth
+        if count > 0:
+            average_depth = total_depth / count
+            print('Average Depth:',average_depth)
+            print('DepthX:',depthx/count)
+            print('DepthY:',depthy/count)
+            return average_depth  # Return depth in meters
+        else:
+            return None  # No points found in the bounding box
